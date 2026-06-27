@@ -1,0 +1,38 @@
+__pycache__/
+*.py[cod]
+
+# Python tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local runtime outputs
+workspace/
+experiments/
+tmp/
+tmp_*/
+tmp_test_out/
+.local-temp/
+.pytest-temp-clean/
+.test-tmp/
+
+# Databases, logs, and generated datasets
+*.sqlite
+*.sqlite3
+*.db
+*.log
+*.jsonl
+*.csv
+*.vtk
+
+# Local agent/editor state
+/.agent/
+.vscode/
+.idea/
+
+# OS/editor noise
+.DS_Store
+*.swp
+*~
