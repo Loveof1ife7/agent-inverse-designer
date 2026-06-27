@@ -19,6 +19,7 @@ tmp_test_out/
 .test-tmp/
 
 # Databases, logs, and generated datasets
+train_datas/
 *.sqlite
 *.sqlite3
 *.db
