@@ -308,7 +308,7 @@ def main() -> int:
     kb = KnowledgeBase(kb_path)
     try:
         evaluator = DatagenFEMEvaluator(workspace_root=workspace, fem_backend=args.fem_backend)
-        inverse_designer = InverseDesigner(kb)
+        inverse_designer = InverseDesigner(kb, workspace_root=workspace)
         inverse_designer.train(training_rows)
         inverse_probe = probe_inverse_designer(inverse_designer, evaluator, target_property)
         print(f"[demo] inverse_probe_label={inverse_probe.get('candidate_eval', {}).get('label', 'none')}")

@@ -1,5 +1,99 @@
 # 数据约定
 
+## 0. 在线 InverseDesigner 调用约定
+
+`src.InverseDesigner.InverseDesigner` 的主契约仍然是：
+
+```text
+target_property -> explicit structure
+```
+
+当前实现支持两层来源：
+
+```text
+1. neural backend:
+   调用已预训练的结构族逆向设计网络
+
+2. retrieval fallback:
+   当神经 backend 未配置、不可用或没有生成候选时，
+   回退到原来的最近邻显式结构检索
+```
+
+结构族 backend 通过环境变量或构造函数注入：
+
+```text
+TPMS:
+  INVERSE_TPMS_CKPT=/path/to/tpms_or_diffumeta.ckpt
+  INVERSE_TPMS_PROJECT_DIR=third-party/DiffusionMetamaterials
+  INVERSE_TPMS_TARGET_KEYS=stiffness_proxy,density_proxy
+
+Truss:
+  INVERSE_TRUSS_BACKEND=graphmetamat
+  INVERSE_GRAPHMETAMAT_PROJECT_DIR=third-party/GraphMetaMat
+  INVERSE_GRAPHMETAMAT_NUM_RUNS=16
+  INVERSE_GRAPHMETAMAT_TOP_K=1
+  INVERSE_GRAPHMETAMAT_DEVICE=cuda
+
+Truss custom wrapper:
+  INVERSE_TRUSS_CALLABLE=my_pkg.truss_wrapper:sample
+  INVERSE_TRUSS_COMMAND='python wrapper.py --ckpt {checkpoint_path} --target {target_json} --out {output_json}'
+  INVERSE_TRUSS_CKPT=/path/to/truss.ckpt
+
+B-spline:
+  INVERSE_BSPLINE_CALLABLE=my_pkg.bspline_wrapper:sample
+  INVERSE_BSPLINE_COMMAND='python wrapper.py --ckpt {checkpoint_path} --target {target_json} --out {output_json}'
+  INVERSE_BSPLINE_CKPT=/path/to/bspline.ckpt
+
+Voxel:
+  INVERSE_VOXEL_CKPT=/path/to/voxel.ckpt
+  INVERSE_VOXEL_PROJECT_DIR=third-party/microstructure_generation_3d
+  INVERSE_VOXEL_TARGET_KEYS=C11,C12,C44,volume_fraction
+```
+
+`CallableBackend` 的 Python wrapper 需接受：
+
+```python
+def sample(target_property, checkpoint_path, output_dir, num_samples, backend_config):
+    ...
+    return {
+        "structure_id": "...",
+        "coordinates": [[...], ...],  # truss-like structures
+        "edges": [[0, 1], ...],
+    }
+```
+
+也可以返回非 truss 表示，例如：
+
+```python
+{
+    "structure_id": "...",
+    "representation": "density_voxel",
+    "voxel_path": ".../sample.npy"
+}
+```
+
+`CommandBackend` 的命令模板可使用：
+
+```text
+{checkpoint_path}
+{output_dir}
+{output_json}
+{target_json}
+{target_csv}
+{num_samples}
+{sample_index}
+```
+
+在线 batch 中，如果 `TargetScheduleItem.expected_effect["structure_family"]`
+没有指定结构族，`sample_schedule` 会在已配置 neural backend 的结构族之间轮转，
+例如：
+
+```text
+tpms -> truss -> b_spline -> voxel -> ...
+```
+
+这样一个 target schedule 可以自然覆盖多种结构表示。
+
 本文件定义快速对齐阶段建议交付的数据字段。推荐格式是 **JSONL**：每一行是一个样本，保存未 padding 的变长字段；训练时再由 dataloader 根据 batch 内或全局 \(n_{\max}\)、\(C_{\max}\) 做 padding 和 mask。
 
 ## 1. 顶点编号约定

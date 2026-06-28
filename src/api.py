@@ -96,7 +96,7 @@ def run_closed_loop_discovery(
     try:
         system = StructureDiscoverySystem(
             knowledge_base=kb,
-            inverse_designer=InverseDesigner(kb),
+            inverse_designer=InverseDesigner(kb, workspace_root=workspace_root),
             agent_explorer=AgentExplorer(),
             evaluator=DatagenFEMEvaluator(workspace_root=workspace_root),
             retrain_trigger=retrain_trigger,
