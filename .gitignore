@@ -20,6 +20,7 @@ tmp_test_out/
 
 # Databases, logs, and generated datasets
 train_datas/
+third-party/
 *.sqlite
 *.sqlite3
 *.db
