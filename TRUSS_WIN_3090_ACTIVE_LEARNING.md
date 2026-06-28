@@ -438,6 +438,37 @@ scp -r .\round001\candidates agent-3090:$root/workspace/truss_active_learning/$r
 scp -r .\round001\fem_runs agent-3090:$root/workspace/truss_active_learning/$round/windows_eval/fem_runs
 ```
 
+Windows upload contract:
+
+```text
+workspace/truss_active_learning/<round>/
+  request.json
+  finetune_config.json
+  windows_eval/
+    evaluated_samples.jsonl
+    candidates/
+      <candidate_id>.gpkl
+      <candidate_id>.vtk
+    fem_runs/
+      <candidate_id>/
+```
+
+Rules:
+
+```text
+request.json and finetune_config.json:
+  UTF-8 JSON
+
+evaluated_samples.jsonl:
+  UTF-8 JSON Lines
+  one candidate per line
+  failed FEM records are allowed, but they never enter supervised finetuning
+
+candidate paths inside evaluated_samples.jsonl:
+  may be relative Linux paths like candidates/<candidate_id>.gpkl
+  may contain stale Windows paths; Linux resolves by basename under windows_eval/candidates
+```
+
 3090 output locations:
 
 ```text
@@ -456,6 +487,166 @@ Input:
 ```text
 workspace/truss_active_learning/<round>/windows_eval/evaluated_samples.jsonl
 ```
+
+3090 runner:
+
+```text
+tools/run_truss_finetune_job.py
+```
+
+Build-only request:
+
+```json
+{
+  "round_id": "round001",
+  "workspace_root": "workspace/truss_active_learning/round001",
+  "windows_eval_dir": "workspace/truss_active_learning/round001/windows_eval",
+  "dataset_output_dir": "workspace/truss_active_learning/round001/dataset_active_round001",
+  "graphmetamat_project_dir": "third-party/GraphMetaMat",
+  "finetune_config_path": "workspace/truss_active_learning/round001/finetune_config.json",
+  "run_training": false
+}
+```
+
+Training request:
+
+```json
+{
+  "round_id": "round001",
+  "workspace_root": "workspace/truss_active_learning/round001",
+  "windows_eval_dir": "workspace/truss_active_learning/round001/windows_eval",
+  "dataset_output_dir": "workspace/truss_active_learning/round001/dataset_active_round001",
+  "graphmetamat_project_dir": "third-party/GraphMetaMat",
+  "finetune_config_path": "workspace/truss_active_learning/round001/finetune_config.json",
+  "run_training": true
+}
+```
+
+Finetune config schema:
+
+```json
+{
+  "schema_version": "truss_finetune_v1",
+  "round_id": "round001",
+  "structure_family": "truss",
+  "curve": {
+    "task": "compression_stress_strain",
+    "length": 256,
+    "strain_min": 0.0,
+    "strain_max": 0.3,
+    "label_source": "windows_fem"
+  },
+  "data": {
+    "min_accepted": 8,
+    "require_no_rejected": false,
+    "require_polyhedron_for_inverse_il": false
+  },
+  "stages": [
+    {
+      "name": "forward_finetune_round001",
+      "kind": "forward_finetune",
+      "enabled": true,
+      "cwd": "third-party/GraphMetaMat",
+      "command": ["/root/miniconda3/bin/python", "main_forward.py"],
+      "timeout_seconds": 86400
+    },
+    {
+      "name": "inverse_rl_round001",
+      "kind": "inverse_rl",
+      "enabled": true,
+      "cwd": "third-party/GraphMetaMat",
+      "command": ["/root/miniconda3/bin/python", "main_inverse.py"],
+      "timeout_seconds": 86400
+    },
+    {
+      "name": "inverse_il_round001",
+      "kind": "inverse_il",
+      "enabled": false,
+      "cwd": "third-party/GraphMetaMat",
+      "command": ["/root/miniconda3/bin/python", "main_inverse.py"],
+      "timeout_seconds": 86400,
+      "requires_polyhedron": true,
+      "on_missing_polyhedron": "skip"
+    }
+  ]
+}
+```
+
+Linux-side checks before training:
+
+```text
+schema_version == truss_finetune_v1
+structure_family == truss
+config.round_id matches request.round_id
+curve.task == compression_stress_strain
+curve.length == 256
+curve.strain_min == 0.0
+curve.strain_max == 0.3
+curve.label_source == windows_fem
+accepted_count >= data.min_accepted
+if data.require_no_rejected: rejected_count == 0
+if inverse IL is required: every accepted sample has *_polyhedron.gpkl
+every enabled stage has command, cwd, positive timeout_seconds
+```
+
+SSH call from Windows:
+
+```powershell
+$root = "/root/autodl-tmp/projects/agent-material"
+$round = "round001"
+
+ssh agent-3090 "cd $root && env -u PYTHONPATH /root/miniconda3/bin/python tools/run_truss_finetune_job.py --request workspace/truss_active_learning/$round/request.json --output workspace/truss_active_learning/$round/finetune_response.json"
+scp agent-3090:$root/workspace/truss_active_learning/$round/finetune_response.json .\round001\finetune_response.json
+```
+
+Response:
+
+```json
+{
+  "status": "success",
+  "round_id": "round001",
+  "dataset_output_dir": ".../dataset_active_round001",
+  "manifest_path": ".../dataset_active_round001/manifest.json",
+  "accepted_count": 12,
+  "rejected_count": 3,
+  "split_counts": {
+    "train": 11,
+    "dev": 1,
+    "test": 0
+  },
+  "can_run_forward_finetune": true,
+  "can_run_inverse_il": false,
+  "polyhedron_count": 0,
+  "config_check": {
+    "status": "valid",
+    "enabled_stage_count": 1,
+    "errors": [],
+    "warnings": []
+  },
+  "training": {
+    "status": "skipped",
+    "reason": "run_training is false"
+  }
+}
+```
+
+Runner behavior:
+
+```text
+run_training == false:
+  build dataset, validate finetune_config if present, do not train
+
+run_training == true and config_check.status == valid:
+  execute enabled finetune_config.stages in order
+
+run_training == true and config_check.status == invalid:
+  return status=config_invalid, do not train
+
+run_training == true but no enabled stages:
+  return status=dataset_built_training_not_configured
+```
+
+The older `training_commands` request field is still accepted for ad-hoc/manual runs, but the closed-loop contract should prefer `finetune_config.json`.
 
 Select supervised records:
 
@@ -507,6 +698,116 @@ Inverse RL finetune:
 Inverse IL finetune:
   requires graphs/{GID}_polyhedron.gpkl or an action-sequence reconstruction pipeline
 ```
+
+## 8.1 What Gets Finetuned
+
+GraphMetaMat has two neural components that matter for the Windows <-> Linux closed loop.
+
+```text
+forward FEM surrogate:
+  structure graph -> stress-strain curve
+
+inverse policy network:
+  target stress-strain curve -> autoregressive graph generation policy
+```
+
+Forward surrogate is the first mandatory stage. It trains GraphMetaMat's `src.generative_curve.model.Model` / `ModelEnsemble`:
+
+```text
+graph encoder / MPNN
+attention pooler
+curve shape decoder
+curve magnitude decoder
+```
+
+Its supervised data comes directly from Windows FEM:
+
+```text
+input:  graphs/{GID}.gpkl
+label:  curves/{CID}.pkl
+        curve = stack(Windows response.strain_grid, Windows response.stress)
+```
+
+Inverse RL policy is the second recommended stage. It trains `src.generative_graph.model_v2.PolicyNetwork`:
+
+```text
+graph state encoder
+target curve encoder
+state-action MLP
+start-node readout
+end-node readout
+stop-token readout
+rho readout
+```
+
+Its reward depends on the latest forward surrogate:
+
+```text
+policy generates graph
+  -> forward surrogate predicts stress curve
+  -> reward compares predicted curve against target curve
+  -> PPO/RL updates policy
+```
+
+Therefore the order should be:
+
+```text
+1. Windows FEM labels new structures.
+2. Linux finetunes forward surrogate on true FEM curves.
+3. Linux uses the updated forward surrogate as inverse RL reward model.
+4. Linux finetunes inverse policy.
+5. Windows FEM benchmark decides whether to promote the checkpoint.
+```
+
+Inverse IL / imitation learning is optional, not required for the first closed loop. It trains the same inverse `PolicyNetwork`, but with supervised action traces rather than reward-only RL.
+
+IL data requires more than the final truss graph:
+
+```text
+graphs/{GID}.gpkl
+  final tessellated truss graph, used by forward surrogate
+
+graphs/{GID}_polyhedron.gpkl
+  generation-space graph, used by graph2action_li(...) to recover policy actions
+
+curves/{CID}.pkl
+  Windows FEM true response curve
+
+mapping.tsv
+  GID <TAB> CID
+```
+
+The IL pair is:
+
+```text
+input curve:
+  Windows FEM true response curve
+
+supervised output:
+  action sequence recovered from {GID}_polyhedron.gpkl
+```
+
+Do not use the agent requested target curve as the IL input label. The generated structure may not actually match that target under real FEM.
+
+If Windows only uploads final `.gpkl` / `.vtk` plus FEM curve:
+
+```text
+can train:
+  forward surrogate
+  inverse RL policy
+
+cannot directly train:
+  inverse IL
+```
+
+If IL is desired later, the 3090 inverse designer export should keep and return one of:
+
+```text
+rank_01_sample_000_polyhedron.gpkl
+rank_01_sample_000_action_trace.pkl
+```
+
+Windows should store that artifact with the candidate and upload it back after FEM evaluation. The Linux runner already detects uploaded polyhedron files and sets `can_run_inverse_il=true` only when every accepted sample has the required `_polyhedron.gpkl`.
 
 Recommended finetune order:
 
@@ -575,4 +876,3 @@ One-line summary:
 ```text
 Windows plans targets and supplies truth; 3090 proposes truss structures, predicts cheaply, and trains.
 ```
-

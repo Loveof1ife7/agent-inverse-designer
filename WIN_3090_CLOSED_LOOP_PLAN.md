@@ -457,6 +457,27 @@ Input:
 workspace/active_learning/<round>/windows_eval/evaluated_samples.jsonl
 ```
 
+For the truss closed loop, use the truss-specific 3090 workspace:
+
+```text
+workspace/truss_active_learning/<round>/
+  request.json
+  finetune_config.json
+  windows_eval/
+    evaluated_samples.jsonl
+    candidates/
+    fem_runs/
+```
+
+Linux runner:
+
+```bash
+cd /root/autodl-tmp/projects/agent-material
+env -u PYTHONPATH /root/miniconda3/bin/python tools/run_truss_finetune_job.py \
+  --request workspace/truss_active_learning/<round>/request.json \
+  --output workspace/truss_active_learning/<round>/finetune_response.json
+```
+
 Select records:
 
 ```text
@@ -514,6 +535,75 @@ Important:
 ```text
 GraphMetaMat surrogate curve is not a label.
 response.stress from Windows FEM is the label.
+```
+
+Truss finetune config should make the intended stages explicit:
+
+```json
+{
+  "schema_version": "truss_finetune_v1",
+  "round_id": "round001",
+  "structure_family": "truss",
+  "curve": {
+    "task": "compression_stress_strain",
+    "length": 256,
+    "strain_min": 0.0,
+    "strain_max": 0.3,
+    "label_source": "windows_fem"
+  },
+  "data": {
+    "min_accepted": 8,
+    "require_no_rejected": false,
+    "require_polyhedron_for_inverse_il": false
+  },
+  "stages": [
+    {
+      "name": "forward_finetune_round001",
+      "kind": "forward_finetune",
+      "enabled": true,
+      "cwd": "third-party/GraphMetaMat",
+      "command": ["/root/miniconda3/bin/python", "main_forward.py"],
+      "timeout_seconds": 86400
+    },
+    {
+      "name": "inverse_rl_round001",
+      "kind": "inverse_rl",
+      "enabled": true,
+      "cwd": "third-party/GraphMetaMat",
+      "command": ["/root/miniconda3/bin/python", "main_inverse.py"],
+      "timeout_seconds": 86400
+    },
+    {
+      "name": "inverse_il_round001",
+      "kind": "inverse_il",
+      "enabled": false,
+      "cwd": "third-party/GraphMetaMat",
+      "command": ["/root/miniconda3/bin/python", "main_inverse.py"],
+      "timeout_seconds": 86400,
+      "requires_polyhedron": true,
+      "on_missing_polyhedron": "skip"
+    }
+  ]
+}
+```
+
+Stage meaning:
+
+```text
+forward_finetune:
+  trains GraphMetaMat structure -> FEM curve surrogate
+  data needed: final graph + Windows FEM curve
+  this is mandatory for active learning
+
+inverse_rl:
+  trains target curve -> graph-generation policy by PPO/RL
+  data needed: active curve distribution and latest forward surrogate reward
+  this is recommended after forward_finetune
+
+inverse_il:
+  supervised warm start for the same inverse PolicyNetwork
+  data needed: final graph + Windows FEM curve + *_polyhedron.gpkl or action trace
+  this is optional and should be skipped when only final gpkl/vtk exists
 ```
 
 ## 7. Agent Policy on Windows
@@ -599,4 +689,3 @@ One-line summary:
 ```text
 Windows is the planner and physics judge; the 3090 is the neural generator and training factory.
 ```
-
