@@ -393,9 +393,32 @@ Round flow:
      acceptable node/edge/rho/radius constraints
 6. Windows FEM evaluates selected candidates.
 7. Windows writes evaluated_samples.jsonl.
-8. Windows uploads evaluated_samples.jsonl and accepted artifacts to 3090.
-9. 3090 builds active dataset version and finetunes.
-10. Windows runs benchmark FEM eval before checkpoint promotion.
+8. Windows accumulates evaluated samples until the retrain trigger is reached.
+9. Windows uploads evaluated_samples.jsonl and accepted artifacts to 3090.
+10. 3090 builds active dataset version and finetunes.
+11. Windows runs benchmark FEM eval before checkpoint promotion.
+```
+
+Closed-loop defaults:
+
+```text
+fem_backend = "abaqus"
+  Use the real Windows Abaqus simulator through
+  src/DatagenFEMEvaluator/core/truss/fem.py.
+
+retrain_trigger = 32
+  Do not finetune after one or two samples.
+  Accumulate enough Windows FEM truth for a meaningful active-learning batch.
+```
+
+Debug-only overrides:
+
+```text
+fem_backend = "proxy"
+  allowed for unit tests and smoke tests, not for active-learning labels.
+
+retrain_trigger = 1
+  allowed only to test plumbing; do not use for scientific closed-loop runs.
 ```
 
 Acquisition score example:
@@ -852,10 +875,11 @@ Windows:
 [ ] Download gpkl/vtk/png artifacts.
 [ ] Optionally call forward predictor for each candidate.
 [ ] Select candidates for FEM.
-[ ] Run real FEM.
+[ ] Run real FEM with src/DatagenFEMEvaluator/core/truss/fem.py / Abaqus.
 [ ] Resample true stress to np.linspace(0.0, 0.3, 256).
 [ ] Write evaluated_samples.jsonl.
-[ ] Upload round directory to 3090.
+[ ] Wait until enough evaluated samples are accumulated.
+[ ] Upload round directory to 3090 when retrain_trigger is reached.
 ```
 
 3090:

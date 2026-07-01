@@ -52,6 +52,32 @@ DatasetManager
     stores labels, tracks training cursors, triggers model updates
 ```
 
+Core dual-path graph:
+
+```mermaid
+flowchart TD
+    A[TargetCurvePlanner<br/>final target -> planned target curves]
+    B[InverseDesigner<br/>planned targets -> explicit structures]
+    C[ForwardSurrogate<br/>fast approximate stress curves]
+    D[Top K selector<br/>rank by curve_nmae]
+    E[simulation_backlog<br/>accumulate FEM batch]
+    F[HighPrecisionFEM<br/>high-trust simulation stress curves]
+    G[DatasetManager<br/>labels, cursors, model triggers]
+    H[InverseDesigner finetune<br/>surrogate + simulation weighted rows]
+    I[ForwardSurrogate finetune<br/>simulation truth rows only]
+
+    A --> B
+    B --> C
+    C --> D
+    D --> E
+    E --> F
+
+    C -->|surrogate pairs<br/>weak inverse labels| G
+    F -->|simulation pairs<br/>truth labels| G
+    G --> H
+    G --> I
+```
+
 ### Detail Subgraphs
 
 #### One-Iteration Data Path
