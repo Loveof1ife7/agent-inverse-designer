@@ -48,7 +48,7 @@ class DesignSearchParameters:
 
 @dataclass(frozen=True)
 class DatagenConfig:
-    # Suggestion identity and provenance. AgentExplorer owns these fields.
+    # Suggestion identity and provenance for legacy datagen runs.
     suggestion_id: str = ""
     parent_sample_id: str = ""
     source: str = "agent_exploration"
@@ -68,7 +68,7 @@ class DatagenConfig:
     print_every: int = 1
     run_dir: str = ""
 
-    # Structure semantics persisted into KnowledgeBase.
+    # Structure semantics persisted with generated samples.
     symmetry: str = "P222"
     basic_unit_type: str = "edge_face_center_19node"
     unit_cell_type: str = "symmetry_expanded_truss"
@@ -159,7 +159,7 @@ class BatchProposal:
 
 @dataclass(frozen=True)
 class TargetScheduleItem:
-    """One scheduled target that AgentExplorer asks InverseDesigner to realize."""
+    """One scheduled target that InverseDesigner should try to realize."""
 
     target_id: str
     target_property: dict[str, float]
@@ -183,7 +183,7 @@ class TargetScheduleItem:
 
 @dataclass(frozen=True)
 class TargetSchedule:
-    """AgentExplorer's online action: choose targets for InverseDesigner to sample."""
+    """A batch of target curves for InverseDesigner to sample."""
 
     schedule_id: str
     final_target: dict[str, float]
@@ -552,7 +552,7 @@ class ReasonedAgentKnowledgeSnapshot:
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
-        # Compatibility: expose statistical fields at top level for current AgentExplorer.
+        # Compatibility: expose statistical fields at top level for older readers.
         for key, value in self.statistical_snapshot.items():
             payload.setdefault(key, value)
         payload["statistical"] = dict(self.statistical_snapshot)
@@ -561,7 +561,7 @@ class ReasonedAgentKnowledgeSnapshot:
 
 @dataclass(frozen=True)
 class KnowledgeDecisionPackage:
-    """Unified KnowledgeRefiner -> AgentExplorer handoff."""
+    """Legacy decision package retained for serialized compatibility."""
 
     contract_version: str
     generated_at: str
@@ -584,7 +584,7 @@ class KnowledgeDecisionPackage:
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
-        # Compatibility aliases for existing AgentExplorer readers.
+        # Compatibility aliases for older serialized readers.
         payload["statistical"] = dict(self.deterministic_snapshot)
         payload["interpretation"] = dict(self.interpreted_guidance)
         payload["next_schedule_policy"] = dict(self.deterministic_policy)

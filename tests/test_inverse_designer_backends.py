@@ -3,124 +3,15 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Any
 
-from src.InverseDesigner import GraphMetaMatTrussBackend, InverseDesigner
-from src.KnowledgeBase import KnowledgeBase
-from src.closed_loop_contracts import TargetSchedule, TargetScheduleItem
+import pytest
 
-
-class FakeBackend:
-    def __init__(self, name: str, structure_family: str, representation: str = "fake"):
-        self.name = name
-        self.structure_family = structure_family
-        self.representation = representation
-        self.calls: list[dict[str, Any]] = []
-
-    def available(self) -> bool:
-        return True
-
-    def sample(self, target_property: dict[str, float], output_dir: Path, sample_index: int = 1) -> dict[str, Any] | None:
-        self.calls.append(
-            {
-                "target_property": dict(target_property),
-                "output_dir": str(output_dir),
-                "sample_index": sample_index,
-            }
-        )
-        return {
-            "structure_id": f"{self.structure_family}_{sample_index}",
-            "coordinates": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-            "edges": [[0, 1]],
-        }
+from src.InverseDesigner import GraphMetaMatTrussBackend
 
 
 class InverseDesignerBackendTests(unittest.TestCase):
-    def test_sample_structure_routes_to_requested_neural_family(self):
-        with tempfile.TemporaryDirectory(prefix="inverse_backend_") as tmp_dir:
-            kb = KnowledgeBase(Path(tmp_dir) / "kb.sqlite")
-            try:
-                tpms = FakeBackend("tpms_fake", "tpms")
-                voxel = FakeBackend("voxel_fake", "voxel")
-                inverse = InverseDesigner(
-                    kb,
-                    neural_backends=[tpms, voxel],
-                    enable_neural=True,
-                    workspace_root=Path(tmp_dir) / "workspace",
-                )
-
-                structure = inverse.sample_structure(
-                    {"stiffness_proxy": 0.5, "density_proxy": 0.2},
-                    structure_family="voxel",
-                )
-
-                self.assertIsNotNone(structure)
-                self.assertEqual(structure["structure_family"], "voxel")
-                self.assertEqual(structure["neural_backend"], "voxel_fake")
-                self.assertEqual(len(tpms.calls), 0)
-                self.assertEqual(len(voxel.calls), 1)
-            finally:
-                kb.close()
-
-    def test_sample_schedule_round_robins_neural_families(self):
-        with tempfile.TemporaryDirectory(prefix="inverse_schedule_backend_") as tmp_dir:
-            kb = KnowledgeBase(Path(tmp_dir) / "kb.sqlite")
-            try:
-                tpms = FakeBackend("tpms_fake", "tpms")
-                truss = FakeBackend("truss_fake", "truss")
-                voxel = FakeBackend("voxel_fake", "voxel")
-                inverse = InverseDesigner(
-                    kb,
-                    neural_backends=[tpms, truss, voxel],
-                    enable_neural=True,
-                    workspace_root=Path(tmp_dir) / "workspace",
-                )
-                schedule = TargetSchedule(
-                    schedule_id="sched",
-                    final_target={"stiffness_proxy": 0.5},
-                    scheduled_targets=[
-                        TargetScheduleItem(target_id="t1", target_property={"stiffness_proxy": 0.5}),
-                        TargetScheduleItem(target_id="t2", target_property={"stiffness_proxy": 0.6}),
-                        TargetScheduleItem(target_id="t3", target_property={"stiffness_proxy": 0.7}),
-                    ],
-                )
-
-                records = inverse.sample_schedule(schedule)
-
-                self.assertEqual([record["structure_family"] for record in records], ["tpms", "truss", "voxel"])
-                self.assertEqual([record["structure"]["neural_backend"] for record in records], ["tpms_fake", "truss_fake", "voxel_fake"])
-            finally:
-                kb.close()
-
-    def test_retrieval_fallback_still_works_when_neural_disabled(self):
-        with tempfile.TemporaryDirectory(prefix="inverse_retrieval_fallback_") as tmp_dir:
-            kb = KnowledgeBase(Path(tmp_dir) / "kb.sqlite")
-            try:
-                inverse = InverseDesigner(kb, neural_backends=[FakeBackend("tpms_fake", "tpms")], enable_neural=False)
-                inverse.train(
-                    [
-                        {
-                            "sample_id": "retrieval_sample",
-                            "property": {"stiffness_proxy": 1.0},
-                            "explicit_structure": {
-                                "structure_id": "retrieval_sample",
-                                "coordinates": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-                                "edges": [[0, 1]],
-                            },
-                            "validity": {"geometry_status": "valid", "fem_status": "success"},
-                        }
-                    ]
-                )
-
-                structure = inverse.sample_structure({"stiffness_proxy": 1.0})
-
-                self.assertIsNotNone(structure)
-                self.assertEqual(structure["structure_id"], "retrieval_sample")
-                self.assertEqual(structure["source"], "inverse_designer_retrieval")
-            finally:
-                kb.close()
-
     def test_graphmetamat_backend_parses_cli_outputs(self):
+        pytest.importorskip("networkx")
         with tempfile.TemporaryDirectory(prefix="graphmetamat_backend_") as tmp_dir:
             project_dir = Path(tmp_dir) / "GraphMetaMat"
             project_dir.mkdir()

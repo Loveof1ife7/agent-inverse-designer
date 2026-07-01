@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import re
 import subprocess
 import sys
 import time
-from dataclasses import MISSING, asdict, dataclass, field, fields
+from dataclasses import MISSING, asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -23,19 +24,42 @@ from ..datagen_contracts import (
     PipelineResult,
     VtkExportResult,
 )
-from .core import abaqus_converter, constraints_solver, crystal_builder, dataset_generator, fem as core_fem
-from .core.inspect_truss_txt import load_truss_from_txt
+from .core.truss import abaqus_converter, constraints_solver, crystal_builder, dataset_generator, fem as core_fem
+from .core.truss.inspect_truss_txt import load_truss_from_txt
+from ..InverseDesigner.remote import RemoteGraphMetaMatClient, RemoteInverseDesignerConfig
+from ..curve_targets import (
+    as_float_list as _curve_as_float_list,
+    fixed_strain_grid as _curve_fixed_strain_grid,
+    is_pair_curve as _curve_is_pair_curve,
+    normalize_stress_curve_target,
+    resample_stress_curve,
+    stress_curve_error_metrics,
+)
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 CORE_DIR = PACKAGE_DIR / "core"
+TRUSS_CORE_DIR = CORE_DIR / "truss"
 PROJECT_ROOT = PACKAGE_DIR.parent.parent
 AbaqusFEMConfig = core_fem.AbaqusFEMConfig
 AbaqusFEMRunResult = core_fem.AbaqusFEMRunResult
 
 
+STRUCTURE_FAMILY_REGISTRY: dict[str, dict[str, Any]] = {
+    "truss": {
+        "status": "active",
+        "core_dir": str(TRUSS_CORE_DIR),
+        "datagen": True,
+        "fem_eval": True,
+        "default_group": "P222",
+        "default_group_db": str(TRUSS_CORE_DIR / "symmetry_group_transforms.json"),
+        "description": "P222/symmetry-group truss dataset generation, Abaqus txt conversion, crystal expansion, and proxy/Abaqus FEM-Eval.",
+    }
+}
+
+
 def _default_group_db() -> str:
-    return str(CORE_DIR / "symmetry_group_transforms.json")
+    return str(TRUSS_CORE_DIR / "symmetry_group_transforms.json")
 
 
 def _default_output_root() -> Path:
@@ -72,7 +96,7 @@ def _compute_replication_counts(lattice_lengths: list[float] | tuple[float, floa
 def _make_group_command(config: "AutoGenerateConfig") -> list[str]:
     command = [
         sys.executable,
-        str(CORE_DIR / "auto_generate_4x4x4.py"),
+        str(TRUSS_CORE_DIR / "auto_generate_4x4x4.py"),
         config.group,
         "--basic-size",
         str(config.basic_size),
@@ -126,8 +150,8 @@ def _read_summary_if_exists(run_dir: Path) -> dict[str, Any] | None:
 
 def _not_exposed(*_args, **_kwargs):
     raise NotImplementedError(
-        "This facade only exposes scheduler-level wrappers around core/auto_generate_4x4x4.py "
-        "and core/run_all_groups_4x4x4.ps1 from DatagenFEMEvaluator/core."
+        "This facade only exposes scheduler-level entrypoints backed by core/truss/auto_generate_4x4x4.py "
+        "and core/truss/run_all_groups_4x4x4.ps1."
     )
 
 
@@ -243,27 +267,6 @@ class BatchGenerateResult:
         }
 
 
-@dataclass
-class BootstrapDatagenResult:
-    output_dir: str
-    kb_path: str
-    dataset_jsonl_path: str
-    summary_path: str
-    total_samples: int
-    label_counts: dict[str, int]
-    run_results: list[AutoGenerateResult]
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "output_dir": self.output_dir,
-            "kb_path": self.kb_path,
-            "dataset_jsonl_path": self.dataset_jsonl_path,
-            "summary_path": self.summary_path,
-            "total_samples": self.total_samples,
-            "label_counts": dict(self.label_counts),
-            "run_results": [item.to_dict() for item in self.run_results],
-        }
-
 
 def _dataclass_field_spec(cls) -> list[dict[str, Any]]:
     spec = []
@@ -289,6 +292,20 @@ def _dataclass_field_spec(cls) -> list[dict[str, Any]]:
 def get_interface_contract() -> dict[str, Any]:
     return {
         "package": "DatagenFEMEvaluator",
+        "role": "offline_truss_dataset_generation_and_fem_eval",
+        "structure_family": "truss",
+        "structure_families": get_structure_family_registry(),
+        "supported_structure_families": get_supported_structure_families(),
+        "layout": {
+            "core_root": str(CORE_DIR),
+            "active_family_root": str(TRUSS_CORE_DIR),
+            "family_layout": "core/<structure_family>",
+            "active_imports": "Project code imports truss-related datagen and FEM modules from core.truss.",
+        },
+        "boundary": (
+            "Build truss-structure datasets and evaluate truss structures with proxy or Abaqus FEM. "
+            "Do not use as the online closed-loop exploration engine."
+        ),
         "stable_public_interface": {
             "class": "DatagenFEMEvaluator",
             "functions": [
@@ -319,7 +336,6 @@ def get_interface_contract() -> dict[str, Any]:
             "AutoGenerateResult": _dataclass_field_spec(AutoGenerateResult),
             "BatchGroupResult": _dataclass_field_spec(BatchGroupResult),
             "BatchGenerateResult": _dataclass_field_spec(BatchGenerateResult),
-            "BootstrapDatagenResult": _dataclass_field_spec(BootstrapDatagenResult),
         },
         "artifacts": {
             "single_run": [
@@ -332,8 +348,6 @@ def get_interface_contract() -> dict[str, Any]:
                 "knowledge_base_seed.jsonl",
                 "auto_generate.stdout.log",
                 "auto_generate.stderr.log",
-                "bootstrap_dataset.jsonl",
-                "bootstrap_summary.json",
             ],
             "batch_run": [
                 "_batch/progress.tsv",
@@ -359,13 +373,20 @@ def get_interface_contract() -> dict[str, Any]:
             "run_dir": "string",
         },
         "notes": [
-            "This facade schedules core/auto_generate_4x4x4.py and does not modify the core math pipeline.",
+            "This facade schedules the truss dataset generation pipeline in core/truss/auto_generate_4x4x4.py and does not modify the core math pipeline.",
             "Paths are normalized for Linux/Windows-compatible launching through Python subprocess.",
             "The preferred KB ingestion artifact is knowledge_base_seed.jsonl.",
             "fem_evaluate supports proxy, abaqus, and auto backends. Proxy remains the default; Abaqus requires ABAQUS_CMD or abq2022/abaqus in PATH.",
-            "bootstrap_dataset_and_kb builds a finite exploratory dataset and inserts the resulting knowledge samples into KnowledgeBase.",
         ],
     }
+
+
+def get_structure_family_registry() -> dict[str, dict[str, Any]]:
+    return json.loads(json.dumps(STRUCTURE_FAMILY_REGISTRY))
+
+
+def get_supported_structure_families() -> list[str]:
+    return sorted(STRUCTURE_FAMILY_REGISTRY)
 
 
 def run_auto_generate_4x4x4(config: AutoGenerateConfig | dict[str, Any]) -> AutoGenerateResult:
@@ -858,7 +879,7 @@ def clean_dataset_and_reindex(*_args, **_kwargs):
 
 
 def plot_truss(*_args, **_kwargs):
-    from .core.inspect_truss_txt import plot_truss as _plot_truss
+    from .core.truss.inspect_truss_txt import plot_truss as _plot_truss
 
     return _plot_truss(*_args, **_kwargs)
 
@@ -1046,17 +1067,154 @@ def _evaluate_structure_proxy(structure: dict[str, Any]) -> FEMResult:
 def _property_error(target_property: dict[str, float], evaluated_property: dict[str, float]) -> dict[str, float]:
     errors = {}
     for key, target_value in target_property.items():
-        observed = float(evaluated_property.get(key, 0.0))
-        target = float(target_value)
+        try:
+            observed = float(evaluated_property.get(key, 0.0))
+            target = float(target_value)
+        except (TypeError, ValueError):
+            continue
         scale = abs(target) if abs(target) > 1e-9 else 1.0
         errors[key] = abs(observed - target) / scale
+    return errors
+
+
+def _as_float_list(value: Any) -> list[float]:
+    return _curve_as_float_list(value)
+
+
+def _fixed_strain_grid(length: int = 256) -> list[float]:
+    return _curve_fixed_strain_grid(length)
+
+
+def _is_pair_curve(value: Any) -> bool:
+    return _curve_is_pair_curve(value)
+
+
+def _stress_curve_target(target_property: dict[str, Any]) -> dict[str, list[float]] | None:
+    return normalize_stress_curve_target(target_property)
+
+
+def _resample_curve(strain: list[float], stress: list[float], target_grid: list[float]) -> list[float]:
+    return resample_stress_curve(strain, stress, target_grid)
+
+
+def _read_stress_curve_csv(path: str | os.PathLike[str]) -> tuple[list[float], list[float]]:
+    curve_path = Path(path)
+    if not curve_path.exists() or curve_path.stat().st_size == 0:
+        return [], []
+    strain: list[float] = []
+    stress: list[float] = []
+    with curve_path.open("r", encoding="utf-8-sig", errors="ignore", newline="") as handle:
+        sample = handle.read(4096)
+        handle.seek(0)
+        has_header = "strain" in sample.lower() or "stress" in sample.lower()
+        if has_header:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                try:
+                    strain_value = row.get("Strain") or row.get("strain") or row.get("x")
+                    stress_value = row.get("Stress_MPa") or row.get("Stress") or row.get("stress") or row.get("y")
+                    if strain_value is None or stress_value is None:
+                        continue
+                    strain.append(float(strain_value))
+                    stress.append(float(stress_value))
+                except (TypeError, ValueError):
+                    continue
+        else:
+            reader = csv.reader(handle)
+            for row in reader:
+                if len(row) < 2:
+                    continue
+                try:
+                    strain.append(float(row[0]))
+                    stress.append(float(row[1]))
+                except ValueError:
+                    continue
+    return strain, stress
+
+
+def _observed_stress_curve(evaluated_property: dict[str, Any], raw_metrics: dict[str, Any]) -> tuple[list[float], list[float]]:
+    for source in (evaluated_property, raw_metrics):
+        target = _stress_curve_target(dict(source or {}))
+        if target:
+            return list(target["strain_grid"]), list(target["stress"])
+    curve_path = raw_metrics.get("fem_curve_path") or raw_metrics.get("raw_curve_csv") or raw_metrics.get("curve_path")
+    if curve_path:
+        return _read_stress_curve_csv(curve_path)
+    return [], []
+
+
+def _remote_forward_curve_payload(response: dict[str, Any]) -> tuple[list[float], list[float], dict[str, Any]]:
+    payload = dict(response or {})
+    for key in ("response", "prediction", "predicted_property", "result", "forward", "forward_prediction"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            nested_strain, nested_stress, nested_payload = _remote_forward_curve_payload(value)
+            if nested_stress:
+                merged = dict(payload)
+                merged.update(nested_payload)
+                return nested_strain, nested_stress, merged
+
+    target = _stress_curve_target(payload)
+    if target:
+        return list(target["strain_grid"]), list(target["stress"]), payload
+
+    for key in ("stress_pred", "predicted_stress", "stress_prediction", "y_pred", "pred"):
+        stress = _as_float_list(payload.get(key))
+        if stress:
+            strain = _as_float_list(payload.get("strain_grid") or payload.get("strain") or payload.get("x"))
+            if not strain:
+                strain = _fixed_strain_grid(len(stress))
+            return strain, stress, payload
+    return [], [], payload
+
+
+def _remote_forward_graph_path(structure: dict[str, Any]) -> str:
+    artifacts = dict(structure.get("artifacts") or {})
+    local_artifacts = dict(artifacts.get("local") or {})
+    for value in (
+        artifacts.get("gpkl"),
+        local_artifacts.get("gpkl"),
+        structure.get("gpkl_path"),
+        structure.get("graph_path"),
+    ):
+        if value:
+            return str(value)
+    return ""
+
+
+def _curve_error_metrics(
+    target_property: dict[str, Any],
+    evaluated_property: dict[str, Any],
+    raw_metrics: dict[str, Any] | None = None,
+) -> dict[str, float]:
+    target = _stress_curve_target(target_property)
+    if not target:
+        return {}
+    observed_strain, observed_stress = _observed_stress_curve(evaluated_property, dict(raw_metrics or {}))
+    if not observed_strain or not observed_stress:
+        return {}
+    observed = {"type": "stress_curve", "strain_grid": observed_strain, "stress": observed_stress}
+    return stress_curve_error_metrics(target, observed)
+
+
+def curve_aware_property_error(
+    target_property: dict[str, Any],
+    evaluated_property: dict[str, Any],
+    raw_metrics: dict[str, Any] | None = None,
+) -> dict[str, float]:
+    errors = _property_error(target_property, evaluated_property)
+    curve_metrics = _curve_error_metrics(target_property, evaluated_property, raw_metrics)
+    if curve_metrics:
+        for key in ("curve_nmae", "peak_error", "energy_error", "initial_modulus_error"):
+            if key in curve_metrics:
+                errors[key] = curve_metrics[key]
     return errors
 
 
 def _label_from_error(property_error: dict[str, float]) -> str:
     if not property_error:
         return "failure"
-    max_error = max(float(value) for value in property_error.values())
+    max_error = float(property_error["curve_nmae"]) if "curve_nmae" in property_error else max(float(value) for value in property_error.values())
     if max_error <= 0.1:
         return "success"
     if max_error <= 0.35:
@@ -1345,10 +1503,12 @@ def run_all_groups_4x4x4(config: BatchGenerateConfig | dict[str, Any]) -> BatchG
 
 class DatagenFEMEvaluator:
     """
-    Agent-facing scheduler facade.
+    Agent-facing facade for truss dataset generation and FEM-Eval.
 
-    This class only wraps scheduler entrypoints under DatagenFEMEvaluator/core
-    and does not change the algorithm scripts themselves.
+    This class only wraps scheduler entrypoints under DatagenFEMEvaluator/core/truss
+    and does not change the algorithm scripts themselves. It is intended for
+    offline cold-start data generation, bootstrap datasets, and explicit truss
+    structure evaluation, not as the online closed-loop exploration engine.
     """
 
     def __init__(
@@ -1359,6 +1519,9 @@ class DatagenFEMEvaluator:
     ):
         self.workspace_root = _as_path(workspace_root) if workspace_root else _default_output_root()
         self.fem_backend = (fem_backend or os.getenv("DATAGEN_FEM_BACKEND", "proxy")).strip().lower()
+        self.remote_forward_device = os.getenv("REMOTE_FORWARD_DEVICE", os.getenv("INVERSE_GRAPHMETAMAT_DEVICE", "cuda"))
+        self.remote_forward_fallback = os.getenv("REMOTE_FORWARD_FALLBACK", "proxy").strip().lower()
+        self._remote_forward_client_instance: RemoteGraphMetaMatClient | None = None
         if isinstance(fem_config, core_fem.AbaqusFEMConfig):
             self.fem_config = fem_config
         elif isinstance(fem_config, dict):
@@ -1370,8 +1533,18 @@ class DatagenFEMEvaluator:
     def interface_contract() -> dict[str, Any]:
         return get_interface_contract()
 
+    @staticmethod
+    def structure_family_registry() -> dict[str, dict[str, Any]]:
+        return get_structure_family_registry()
+
+    @staticmethod
+    def supported_structure_families() -> list[str]:
+        return get_supported_structure_families()
+
     def datagen_schema(self) -> dict[str, Any]:
         return {
+            "active_structure_family": "truss",
+            "supported_structure_families": get_supported_structure_families(),
             "default_group": "P222",
             "default_basic_size": 4,
             "default_num_samples": 8,
@@ -1379,13 +1552,11 @@ class DatagenFEMEvaluator:
                 "summary.json",
                 "generated_data_manifest.json",
                 "knowledge_base_seed.jsonl",
-                "bootstrap_dataset.jsonl",
-                "bootstrap_summary.json",
                 "abaqus_txt/*.txt",
                 "crystal_4x4x4/*.txt",
             ],
             "config_fields": [item.name for item in fields(DatagenConfig)],
-            "fem_backends": ["proxy", "abaqus", "auto"],
+            "fem_backends": ["proxy", "abaqus", "auto", "remote_forward"],
             "active_fem_backend": self.fem_backend,
         }
 
@@ -1422,6 +1593,8 @@ class DatagenFEMEvaluator:
         return records
 
     def fem_evaluate(self, structures: list[dict[str, Any]]) -> list[FEMResult]:
+        if self.fem_backend == "remote_forward":
+            return [self._evaluate_structure_remote_forward(structure) for structure in structures]
         if self.fem_backend == "proxy":
             return [_evaluate_structure_proxy(structure) for structure in structures]
         if self.fem_backend == "auto" and not core_fem.find_abaqus_command(self.fem_config.abaqus_cmd):
@@ -1435,7 +1608,7 @@ class DatagenFEMEvaluator:
             return results
         if self.fem_backend in {"abaqus", "auto"}:
             return [self._evaluate_structure_abaqus(structure) for structure in structures]
-        raise ValueError(f"Unsupported fem_backend={self.fem_backend!r}; expected proxy, abaqus, or auto")
+        raise ValueError(f"Unsupported fem_backend={self.fem_backend!r}; expected proxy, abaqus, auto, or remote_forward")
 
     def evaluate_explicit_structure(
         self,
@@ -1448,7 +1621,9 @@ class DatagenFEMEvaluator:
             fem_result = self.fem_evaluate([structure])[0]
         else:
             nodes, edges = _nodes_edges_from_explicit_structure(structure)
-            if self.fem_backend == "proxy":
+            if self.fem_backend == "remote_forward":
+                fem_result = self._evaluate_structure_remote_forward(structure)
+            elif self.fem_backend == "proxy":
                 fem_result = _evaluate_nodes_edges_proxy(
                     structure_id=structure_id,
                     nodes=nodes,
@@ -1485,16 +1660,47 @@ class DatagenFEMEvaluator:
                 )
                 fem_result.raw_metrics["explicit_structure_path"] = str(explicit_path)
             else:
-                raise ValueError(f"Unsupported fem_backend={self.fem_backend!r}; expected proxy, abaqus, or auto")
-        property_error = _property_error(target_property, fem_result.evaluated_property)
+                raise ValueError(f"Unsupported fem_backend={self.fem_backend!r}; expected proxy, abaqus, auto, or remote_forward")
+        raw_metrics = dict(fem_result.raw_metrics)
+        curve_metrics = _curve_error_metrics(target_property, fem_result.evaluated_property, raw_metrics)
+        evaluated_property = dict(fem_result.evaluated_property)
+        observed_strain, observed_stress = _observed_stress_curve(evaluated_property, raw_metrics)
+        observed_curve = normalize_stress_curve_target(
+            {"type": "stress_curve", "strain_grid": observed_strain, "stress": observed_stress}
+        )
+        if observed_curve:
+            evaluated_property.update(observed_curve)
+        if curve_metrics:
+            raw_metrics["curve_metrics"] = dict(curve_metrics)
+            raw_metrics["final_curve_mae"] = curve_metrics["curve_nmae"]
+            raw_metrics["utility_curve_mae"] = curve_metrics["curve_nmae"]
+            raw_metrics["final_curve_abs_mae"] = curve_metrics["curve_mae"]
+            raw_metrics["utility_curve_abs_mae"] = curve_metrics["curve_mae"]
+            for key in (
+                "peak_error",
+                "energy_error",
+                "initial_modulus_error",
+                "peak_relative_delta",
+                "energy_relative_delta",
+                "initial_modulus_relative_delta",
+                "peak_target",
+                "peak_observed",
+                "energy_target",
+                "energy_observed",
+                "initial_modulus_target",
+                "initial_modulus_observed",
+            ):
+                if key in curve_metrics:
+                    raw_metrics[key] = curve_metrics[key]
+        property_error = curve_aware_property_error(target_property, fem_result.evaluated_property, raw_metrics)
         return {
             "structure_id": fem_result.structure_id,
-            "evaluated_property": dict(fem_result.evaluated_property),
+            "evaluated_property": evaluated_property,
             "property_error": property_error,
             "label": _label_from_error(property_error),
             "fem_status": fem_result.fem_status,
             "geometry_status": fem_result.geometry_status,
-            "raw_metrics": dict(fem_result.raw_metrics),
+            "raw_metrics": raw_metrics,
         }
 
     def collect_explicit_structure_sample(
@@ -1528,7 +1734,7 @@ class DatagenFEMEvaluator:
             "explicit_structure": dict(structure),
             "retrieved_property": dict(structure.get("retrieved_property") or {}),
             "retrieval_distance": structure.get("retrieval_distance"),
-            "fidelity": "abaqus" if "abaqus" in str(evaluation_raw.get("evaluator", "")) else "proxy",
+            "fidelity": str(evaluation_raw.get("fidelity") or ("abaqus" if "abaqus" in str(evaluation_raw.get("evaluator", "")) else "proxy")),
         }
         return KnowledgeSample(
             structure_id=structure_id,
@@ -1555,10 +1761,108 @@ class DatagenFEMEvaluator:
             explicit_structure=dict(structure),
         )
 
+    def _remote_forward_client(self) -> RemoteGraphMetaMatClient:
+        if self._remote_forward_client_instance is None:
+            self._remote_forward_client_instance = RemoteGraphMetaMatClient(RemoteInverseDesignerConfig())
+        return self._remote_forward_client_instance
+
+    def _remote_forward_fallback_result(self, structure: dict[str, Any], reason: str) -> FEMResult:
+        fallback = self.remote_forward_fallback
+        if fallback in {"", "none", "off", "false"}:
+            structure_id = _structure_identifier(structure)
+            return FEMResult(
+                structure_id=structure_id,
+                evaluated_property={},
+                fem_status="remote_forward_unavailable",
+                geometry_status="unknown",
+                raw_metrics={
+                    "evaluator": "remote_graphmetamat_forward",
+                    "fem_backend": "remote_forward",
+                    "fidelity": "remote_forward_surrogate",
+                    "remote_forward_error": reason,
+                    "remote_forward_fallback": "none",
+                },
+            )
+        if fallback == "proxy":
+            result = _evaluate_structure_proxy(structure)
+            result.raw_metrics["fem_backend_requested"] = "remote_forward"
+            result.raw_metrics["fem_backend_fallback"] = "proxy"
+            result.raw_metrics["fem_backend_fallback_reason"] = reason
+            return result
+        if fallback in {"abaqus", "auto"}:
+            original_backend = self.fem_backend
+            self.fem_backend = fallback
+            try:
+                result = self.fem_evaluate([structure])[0]
+            finally:
+                self.fem_backend = original_backend
+            result.raw_metrics["fem_backend_requested"] = "remote_forward"
+            result.raw_metrics["fem_backend_fallback"] = fallback
+            result.raw_metrics["fem_backend_fallback_reason"] = reason
+            return result
+        raise ValueError("REMOTE_FORWARD_FALLBACK must be proxy, abaqus, auto, or none")
+
+    def _evaluate_structure_remote_forward(self, structure: dict[str, Any]) -> FEMResult:
+        structure_id = _structure_identifier(structure)
+        graph_path = _remote_forward_graph_path(structure)
+        if not graph_path:
+            return self._remote_forward_fallback_result(structure, "missing_gpkl_graph_path")
+
+        job_id = re.sub(r"[^A-Za-z0-9_-]+", "_", f"forward_eval_{structure_id}")[:140] or "forward_eval"
+        try:
+            result = self._remote_forward_client().run_truss_forward_predict(
+                graph_path,
+                job_id=job_id,
+                device=self.remote_forward_device,
+            )
+        except Exception as exc:
+            return self._remote_forward_fallback_result(structure, f"{type(exc).__name__}: {exc}")
+
+        strain, stress, payload = _remote_forward_curve_payload(dict(result.response or {}))
+        if result.status not in {"success", "ok", "completed"} or not stress:
+            return self._remote_forward_fallback_result(
+                structure,
+                str(result.response.get("error") or f"remote_forward_status={result.status}"),
+            )
+
+        evaluated_property: dict[str, Any] = {
+            "strain_grid": strain or _fixed_strain_grid(len(stress)),
+            "stress_curve": stress,
+        }
+        for key in ("relative_density", "rho", "density_proxy"):
+            if payload.get(key) is not None:
+                try:
+                    evaluated_property["density_proxy"] = float(payload[key])
+                    break
+                except (TypeError, ValueError):
+                    continue
+
+        raw_metrics = {
+            "evaluator": "remote_graphmetamat_forward",
+            "fem_backend": "remote_forward",
+            "fidelity": "remote_forward_surrogate",
+            "remote_forward_job_id": result.job_id,
+            "remote_forward_status": result.status,
+            "remote_forward_local_dir": result.local_dir,
+            "remote_forward_remote_dir": result.remote_dir,
+            "remote_forward_response_path": result.response_path,
+            "remote_forward_graph_path": graph_path,
+            "strain_grid": evaluated_property["strain_grid"],
+            "stress_curve": stress,
+        }
+        return FEMResult(
+            structure_id=structure_id,
+            evaluated_property=evaluated_property,
+            fem_status="success",
+            geometry_status="valid",
+            raw_metrics=raw_metrics,
+        )
+
     def _evaluate_structure_abaqus(self, structure: dict[str, Any]) -> FEMResult:
         structure_path = structure.get("crystal_txt_path") or structure.get("abaqus_txt_path") or structure.get("structure_path") or ""
         structure_id = _structure_identifier(structure, default=Path(structure_path).stem if structure_path else "inverse_structure")
         fem_run_id = str(structure.get("fem_run_id") or structure.get("original_structure_id") or structure_id)
+        fem_config = self._fem_config_for_structure(structure)
         if not structure_path:
             return FEMResult(
                 structure_id=structure_id,
@@ -1575,7 +1879,7 @@ class DatagenFEMEvaluator:
             structure_path=structure_path,
             structure_id=fem_run_id,
             output_root=self.workspace_root / "fem_runs",
-            config=self.fem_config,
+            config=fem_config,
         )
         evaluated = dict(result.evaluated_property)
         if not evaluated:
@@ -1603,6 +1907,25 @@ class DatagenFEMEvaluator:
             },
         )
 
+    def _fem_config_for_structure(self, structure: dict[str, Any]) -> core_fem.AbaqusFEMConfig:
+        overrides = dict(structure.get("fem_config_overrides") or {})
+        for source_key, target_key in (("beam_radius", "beam_radius"), ("fem_beam_radius", "beam_radius")):
+            if source_key in structure and target_key not in overrides:
+                overrides[target_key] = structure[source_key]
+        if not overrides:
+            return self.fem_config
+
+        valid_fields = {field.name for field in fields(core_fem.AbaqusFEMConfig)}
+        clean: dict[str, Any] = {}
+        for key, value in overrides.items():
+            if key not in valid_fields:
+                continue
+            try:
+                clean[key] = float(value) if key == "beam_radius" else value
+            except (TypeError, ValueError):
+                continue
+        return replace(self.fem_config, **clean) if clean else self.fem_config
+
     def collect_samples(
         self,
         structures: list[dict[str, Any]],
@@ -1615,7 +1938,7 @@ class DatagenFEMEvaluator:
 
         samples = []
         for structure, fem_result in zip(structures, fem_results):
-            property_error = _property_error(target_property, fem_result.evaluated_property)
+            property_error = curve_aware_property_error(target_property, fem_result.evaluated_property, fem_result.raw_metrics)
             label = _label_from_error(property_error)
             datagen_result = dict(structure.get("datagen_result") or {})
             run_dir = str(
@@ -1705,128 +2028,13 @@ class DatagenFEMEvaluator:
         candidate: KnowledgeSample,
         target_property: dict[str, float],
     ) -> dict[str, Any]:
-        property_error = _property_error(target_property, candidate.evaluated_property)
+        property_error = curve_aware_property_error(target_property, candidate.evaluated_property, candidate.metadata.get("raw_metrics") if isinstance(candidate.metadata, dict) else {})
         return {
             "structure_id": candidate.structure_id,
             "evaluated_property": dict(candidate.evaluated_property),
             "property_error": property_error,
             "label": _label_from_error(property_error),
         }
-
-    def bootstrap_dataset_and_kb(
-        self,
-        datagen_configs: list[DatagenConfig | dict[str, Any]],
-        kb_path: str | os.PathLike[str],
-        output_dir: str | os.PathLike[str] | None = None,
-    ) -> BootstrapDatagenResult:
-        bootstrap_dir = _as_path(output_dir) if output_dir else (self.workspace_root / "bootstrap_seed")
-        bootstrap_dir.mkdir(parents=True, exist_ok=True)
-
-        from ..KnowledgeBase import KnowledgeBase
-
-        normalized_configs = [
-            _ensure_bootstrap_config_defaults(_normalize_datagen_config(config), index + 1, bootstrap_dir)
-            for index, config in enumerate(datagen_configs)
-        ]
-
-        run_results: list[AutoGenerateResult] = []
-        all_samples: list[KnowledgeSample] = []
-        dataset_jsonl_path = bootstrap_dir / "bootstrap_dataset.jsonl"
-        summary_path = bootstrap_dir / "bootstrap_summary.json"
-
-        for config in normalized_configs:
-            structures = self.datagen(config)
-            datagen_result_dict = structures[0]["datagen_result"] if structures else {}
-            if datagen_result_dict:
-                run_results.append(AutoGenerateResult(**datagen_result_dict))
-            fem_results = self.fem_evaluate(structures)
-            bootstrap_target = _derive_bootstrap_target_property(config, fem_results)
-            seeded_config = DatagenConfig(
-                suggestion_id=config.suggestion_id,
-                parent_sample_id=config.parent_sample_id,
-                source=config.source,
-                target_property=bootstrap_target,
-                expected_property=dict(config.expected_property) if config.expected_property else dict(bootstrap_target),
-                objective=config.objective,
-                confidence=config.confidence,
-                group=config.group,
-                basic_size=config.basic_size,
-                num_samples=config.num_samples,
-                workers=config.workers,
-                batch=config.batch,
-                print_every=config.print_every,
-                run_dir=config.run_dir,
-                symmetry=config.symmetry,
-                basic_unit_type=config.basic_unit_type,
-                unit_cell_type=config.unit_cell_type,
-                topology_type=config.topology_type,
-                connectivity_pattern=config.connectivity_pattern,
-                max_bars=config.max_bars,
-                rho_target=config.rho_target,
-                density_range=config.density_range,
-                parameter_ranges=dict(config.parameter_ranges),
-                sampling_strategy=config.sampling_strategy,
-                constraints=dict(config.constraints),
-                design_search_parameters=config.design_search_parameters,
-                hypothesis=config.hypothesis,
-                reason=config.reason,
-                failure_analysis=dict(config.failure_analysis),
-                exploration_strategy=config.exploration_strategy,
-                tags=tuple(config.tags),
-            )
-            samples = self.collect_samples(
-                structures=structures,
-                fem_results=fem_results,
-                target_property=bootstrap_target,
-                datagen_config=seeded_config,
-            )
-            for sample in samples:
-                sample.metadata.setdefault("bootstrap", {})
-                sample.metadata["bootstrap"].update(
-                    {
-                        "mode": "finite_exploration_seed",
-                        "seed_target_property": bootstrap_target,
-                        "seed_objective": "build_regularized_base_dataset_and_knowledge_base",
-                    }
-                )
-            all_samples.extend(samples)
-
-        label_counts: dict[str, int] = {}
-        with dataset_jsonl_path.open("w", encoding="utf-8") as handle:
-            for sample in all_samples:
-                label_counts[sample.label] = label_counts.get(sample.label, 0) + 1
-                handle.write(json.dumps(sample.to_dict(), ensure_ascii=False) + "\n")
-
-        kb_realpath = _as_path(kb_path)
-        kb = KnowledgeBase(kb_realpath)
-        try:
-            kb.add_samples(all_samples)
-        finally:
-            kb.close()
-
-        summary = {
-            "format_version": 1,
-            "output_dir": str(bootstrap_dir),
-            "kb_path": str(kb_realpath),
-            "dataset_jsonl_path": str(dataset_jsonl_path),
-            "total_samples": len(all_samples),
-            "label_counts": label_counts,
-            "groups": [config.group for config in normalized_configs],
-            "suggestion_ids": [config.suggestion_id for config in normalized_configs],
-            "run_dirs": [config.run_dir for config in normalized_configs],
-            "runs": [result.to_dict() for result in run_results],
-        }
-        summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-
-        return BootstrapDatagenResult(
-            output_dir=str(bootstrap_dir),
-            kb_path=str(kb_realpath),
-            dataset_jsonl_path=str(dataset_jsonl_path),
-            summary_path=str(summary_path),
-            total_samples=len(all_samples),
-            label_counts=label_counts,
-            run_results=run_results,
-        )
 
     def auto_generate_4x4x4(self, config: AutoGenerateConfig | dict[str, Any]) -> AutoGenerateResult:
         if isinstance(config, dict):
@@ -1883,7 +2091,6 @@ class DatagenFEMEvaluator:
 
 
 auto_generate_4x4x4 = run_auto_generate_4x4x4
-bootstrap_dataset_and_kb = DatagenFEMEvaluator.bootstrap_dataset_and_kb
 
 
 __all__ = [
@@ -1894,10 +2101,8 @@ __all__ = [
     "BatchGenerateConfig",
     "BatchGenerateResult",
     "BatchGroupResult",
-    "BootstrapDatagenResult",
     "DatagenFEMEvaluator",
     "auto_generate_4x4x4",
-    "bootstrap_dataset_and_kb",
     "clean_dataset_and_reindex",
     "csv_to_abaqus",
     "deduplicate_architecture_csv",
@@ -1905,6 +2110,8 @@ __all__ = [
     "export_txt_to_vtk",
     "generate_architecture_csv",
     "get_interface_contract",
+    "get_structure_family_registry",
+    "get_supported_structure_families",
     "plot_truss",
     "preview_generation_batch",
     "run_all_groups_4x4x4",

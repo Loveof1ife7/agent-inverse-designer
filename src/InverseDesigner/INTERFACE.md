@@ -48,7 +48,42 @@ Voxel:
   INVERSE_VOXEL_CKPT=/path/to/voxel.ckpt
   INVERSE_VOXEL_PROJECT_DIR=third-party/microstructure_generation_3d
   INVERSE_VOXEL_TARGET_KEYS=C11,C12,C44,volume_fraction
+
+Remote truss closed-loop adapter (default for run_closed_loop_discovery):
+  INVERSE_DESIGNER_MODE=remote_graphmetamat
+  REMOTE_INVERSE_SSH_ALIAS=data-center-ps
+  REMOTE_INVERSE_ROOT=/root/autodl-tmp/projects/agent-material
+  REMOTE_INVERSE_PYTHON=/root/miniconda3/bin/python
+  REMOTE_INVERSE_RUN_TRAINING=0
 ```
+
+The remote adapter is `RemoteGraphMetaMatInverseDesigner`. It implements the
+closed-loop methods `sample_structure(...)`, `sample_schedule(...)`, and
+`finetune(...)`. Set `INVERSE_DESIGNER_MODE=local` only for the local retrieval
+or local neural-backend path.
+
+Remote truss inverse requests use stress-curve targets only:
+
+```json
+{
+  "stress_curve": [0.0, 0.1, 0.2],
+  "strain_grid": [0.0, 0.15, 0.3]
+}
+```
+
+The Windows side calls the remote base environment through:
+
+```text
+cd /root/autodl-tmp/projects/agent-material
+env -u PYTHONPATH /root/miniconda3/bin/python -m tools.run_inverse_design_job ...
+env -u PYTHONPATH /root/miniconda3/bin/python tools/run_truss_forward_predict.py ...
+env -u PYTHONPATH /root/miniconda3/bin/python tools/run_truss_finetune_job.py ...
+```
+
+Windows FEM is the only active-learning truth. Remote forward/surrogate output is
+kept as provenance and must not be written into `response.stress`. During
+`finetune(...)`, Windows FEM curves are resampled to the fixed grid
+`np.linspace(0.0, 0.3, 256)` before upload.
 
 `CallableBackend` 的 Python wrapper 需接受：
 

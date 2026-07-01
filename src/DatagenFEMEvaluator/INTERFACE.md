@@ -1,5 +1,16 @@
 # DatagenFEMEvaluator Interface
 
+`src/DatagenFEMEvaluator` is the truss-structure dataset generation and
+FEM-Eval facade. It wraps the P222 / symmetry-group truss generation pipeline,
+the conversion from generated topology records to Abaqus-compatible truss txt
+files, optional crystal expansion, and property evaluation through proxy or
+Abaqus FEM.
+
+In the closed-loop system, this package is an offline data factory for cold
+start and dataset building. It should not be treated as the online exploration
+engine; online candidates should come from `InverseDesigner`, and explicit
+structures should be validated by the FEM evaluation path.
+
 ```
 1. 输入 group
    从 symmetry_group_transforms.json 读群矩阵 M_sym、lattice_lengths。
@@ -49,12 +60,16 @@
 
 ```
 
-This package is the agent-facing scheduler facade for the datagen engine under `DatagenFEMEvaluator/core`.
+This package is the agent-facing scheduler facade for the truss datagen and
+FEM-Eval engine under `DatagenFEMEvaluator/core/truss`.
 
 The core math and geometry scripts remain the source of truth.
 The public interface here is responsible for:
 
 - launching the core pipeline
+- generating truss-structure dataset artifacts
+- converting generated truss records into Abaqus-compatible txt files
+- evaluating generated or explicit truss structures with proxy or Abaqus FEM
 - cross-platform path and environment compatibility
 - collecting structured outputs
 - exposing KB-friendly generated-data manifests

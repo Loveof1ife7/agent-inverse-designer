@@ -12,12 +12,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
-CORE = SRC / "DatagenFEMEvaluator" / "core"
+CORE = SRC / "DatagenFEMEvaluator" / "core" / "truss"
 CORE_GROUP_DB = CORE / "symmetry_group_transforms.json"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.agent_api import AgentDatagenAPI
 from src.api import (
     convert_csv_to_abaqus,
     deduplicate_architecture_csv,
@@ -100,20 +99,6 @@ class RefactorCompatibilityTests(unittest.TestCase):
 
             self.assertEqual(legacy_batch, refactored_batch)
             self.assertGreater(len(refactored_batch), 0)
-
-    def test_agent_api_preview_batch_matches_public_api(self):
-        config = GeneratorConfig(
-            OUTPUT_DIR=str(ROOT / "tmp_test_out"),
-            CSV_NAME="agent.csv",
-            TARGET_SAMPLES=1,
-        )
-        seed = 2024
-        batch_size = 1
-
-        direct_batch = preview_generation_batch(config, batch_size=batch_size, seed=seed)
-        agent_batch = AgentDatagenAPI.preview_batch(config, batch_size=batch_size, seed=seed)
-
-        self.assertEqual(direct_batch, agent_batch)
 
     def test_solve_constraints_matches_legacy_payload(self):
         with tempfile.TemporaryDirectory(prefix="truss_constraints_cmp_") as tmp_dir:
@@ -357,28 +342,6 @@ class RefactorCompatibilityTests(unittest.TestCase):
             dir_result = export_txt_to_vtk(abaqus_dir, tmp_path / "abaqus_vtk")
             self.assertEqual(len(dir_result.exported_files), 1)
             self.assertTrue((tmp_path / "abaqus_vtk" / "0.vtk").exists())
-
-    def test_agent_api_run_pipeline_returns_structured_result(self):
-        with tempfile.TemporaryDirectory(prefix="truss_agent_pipeline_") as tmp_dir:
-            result = AgentDatagenAPI.run_pipeline(
-                {
-                    "group": "P222",
-                    "basic_size": 4,
-                    "samples": 1,
-                    "workers": 1,
-                    "batch": 1,
-                    "print_every": 1,
-                    "run_dir": tmp_dir,
-                }
-            )
-
-            self.assertEqual(result["group"], "P222")
-            self.assertEqual(result["replication"], {"nx": 2, "ny": 2, "nz": 4})
-            self.assertTrue(Path(result["summary_path"]).exists())
-            self.assertIn("constraints", result)
-            self.assertIn("generation", result)
-            self.assertIn("abaqus", result)
-            self.assertIn("crystal", result)
 
     def test_cli_pipeline_and_vtk_smoke(self):
         with tempfile.TemporaryDirectory(prefix="truss_cli_smoke_") as tmp_dir:
