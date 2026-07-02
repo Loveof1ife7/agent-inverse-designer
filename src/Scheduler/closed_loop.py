@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +39,7 @@ class DeterministicLoopConfig:
     sim_batch_size: int = 24
     finetune_min_new_rows: int = 100
     acceptance_curve_nmae: float = 0.05
+    surrogate_inverse_training_curve_nmae: float = 0.05
     usable_training_curve_nmae: float = 0.20
     inverse_num_runs: int = 64
     inverse_batch_size: int = 32
@@ -58,6 +59,11 @@ class DeterministicLoopConfig:
         object.__setattr__(self, "sim_batch_size", max(1, int(self.sim_batch_size)))
         object.__setattr__(self, "finetune_min_new_rows", max(1, int(self.finetune_min_new_rows)))
         object.__setattr__(self, "acceptance_curve_nmae", max(0.0, float(self.acceptance_curve_nmae)))
+        object.__setattr__(
+            self,
+            "surrogate_inverse_training_curve_nmae",
+            max(0.0, float(self.surrogate_inverse_training_curve_nmae)),
+        )
         object.__setattr__(self, "usable_training_curve_nmae", max(0.0, float(self.usable_training_curve_nmae)))
         object.__setattr__(self, "inverse_num_runs", max(1, int(self.inverse_num_runs)))
         object.__setattr__(self, "inverse_batch_size", max(1, int(self.inverse_batch_size)))
@@ -84,6 +90,7 @@ class DeterministicLoopConfig:
             "sim_batch_size": self.sim_batch_size,
             "finetune_min_new_rows": self.finetune_min_new_rows,
             "acceptance_curve_nmae": self.acceptance_curve_nmae,
+            "surrogate_inverse_training_curve_nmae": self.surrogate_inverse_training_curve_nmae,
             "usable_training_curve_nmae": self.usable_training_curve_nmae,
             "inverse_num_runs": self.inverse_num_runs,
             "inverse_batch_size": self.inverse_batch_size,
@@ -217,10 +224,7 @@ class DeterministicSurrogateClosedLoopSystem:
                         },
                     )
                 )
-        pairs: list[CurveLabelPair] = []
-        for pair in raw_pairs:
-            pairs.append(self.dataset_manager.append_surrogate_pair(pair))
-        return pairs
+        return list(raw_pairs)
 
     def process_slow_queue(
         self,
@@ -345,6 +349,10 @@ class DeterministicSurrogateClosedLoopSystem:
         top_k_surrogate = ranked_surrogate[: self.config.surrogate_top_k]
         top_k_ids = {str(item.get("structure_id") or "") for item in top_k_surrogate}
         surrogate_accepted_count = sum(1 for item in ranked_surrogate if item["accepted"])
+        surrogate_training_pairs = self._append_inverse_surrogate_training_pairs(
+            surrogate_pairs,
+            surrogate_acceptance=surrogate_acceptance,
+        )
         self._append_simulation_backlog(records, top_k_ids=top_k_ids, iteration=iteration, surrogate_acceptance=surrogate_acceptance)
         self._emit(
             logs,
@@ -355,6 +363,8 @@ class DeterministicSurrogateClosedLoopSystem:
                 "pair_count": len(surrogate_pairs),
                 "label_source": "surrogate",
                 "accepted_count": surrogate_accepted_count,
+                "inverse_training_pair_count": len(surrogate_training_pairs),
+                "inverse_training_curve_nmae_threshold": self.config.surrogate_inverse_training_curve_nmae,
                 "top_k_count": len(top_k_ids),
                 "top_k_structure_ids": list(top_k_ids),
                 "acceptance": surrogate_acceptance,
@@ -418,6 +428,7 @@ class DeterministicSurrogateClosedLoopSystem:
             "target_plan": plan.to_dict(),
             "structure_records": [self._record_without_structure(record) | {"has_structure": bool(record.get("structure"))} for record in records],
             "surrogate_pairs": [pair.to_dict() for pair in surrogate_pairs],
+            "surrogate_training_pairs": [pair.to_dict() for pair in surrogate_training_pairs],
             "simulation_pairs": [pair.to_dict() for pair in simulation_pairs],
             "surrogate_acceptance": surrogate_acceptance,
             "surrogate_ranking": ranked_surrogate,
@@ -484,6 +495,39 @@ class DeterministicSurrogateClosedLoopSystem:
             }
             self.simulation_backlog.append(queued)
             self._simulation_backlog_ids.add(structure_id)
+
+    def _append_inverse_surrogate_training_pairs(
+        self,
+        pairs: list[CurveLabelPair],
+        *,
+        surrogate_acceptance: list[dict[str, Any]],
+    ) -> list[CurveLabelPair]:
+        acceptance_by_pair = {
+            str(item.get("pair_id") or ""): dict(item)
+            for item in surrogate_acceptance
+        }
+        threshold = self.config.surrogate_inverse_training_curve_nmae
+        appended: list[CurveLabelPair] = []
+        for pair in pairs:
+            acceptance = acceptance_by_pair.get(pair.pair_id, {})
+            curve_nmae = _safe_float(acceptance.get("curve_nmae"), float("inf"))
+            if curve_nmae > threshold:
+                continue
+            gated_pair = replace(
+                pair,
+                provenance={
+                    **dict(pair.provenance),
+                    "surrogate_acceptance": acceptance,
+                    "inverse_training_gate": {
+                        "policy": "surrogate_curve_close_to_target",
+                        "curve_nmae": curve_nmae,
+                        "threshold": threshold,
+                        "passed": True,
+                    },
+                },
+            )
+            appended.append(self.dataset_manager.append_surrogate_pair(gated_pair))
+        return appended
 
     def _pop_simulation_batch(
         self,

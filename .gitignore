@@ -17,6 +17,7 @@ tmp_test_out/
 .local-temp/
 .pytest-temp-clean/
 .test-tmp/
+remote_inverse_jobs/
 
 # Databases, logs, and generated datasets
 train_datas/

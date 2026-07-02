@@ -9,6 +9,7 @@ from typing import Any
 from ..DatagenFEMEvaluator import DatagenFEMEvaluator
 from ..closed_loop_contracts import CurveLabelPair
 from ..curve_targets import normalize_target_property
+from .gid_c3d4_remote import RemoteGidC3D4Evaluator
 
 
 P222_NORMALIZED_TO_PHYSICAL_SCALE = 27.494974
@@ -22,18 +23,24 @@ class HighPrecisionFEM:
         self,
         *,
         workspace_root: str | Path = "workspace",
-        evaluator: DatagenFEMEvaluator | None = None,
+        evaluator: Any | None = None,
         backend: str = "abaqus",
         inverse_label_weight: float = 1.0,
         max_workers: int | None = None,
         align_remote_graphmetamat_to_p222: bool = True,
     ) -> None:
         self.workspace_root = Path(workspace_root)
-        self.evaluator = evaluator or DatagenFEMEvaluator(workspace_root=self.workspace_root, fem_backend=backend)
+        is_gid_c3d4_backend = backend in {"gid_c3d4_remote", "remote_gid_c3d4", "c3d4_remote"}
+        if evaluator is not None:
+            self.evaluator = evaluator
+        elif is_gid_c3d4_backend:
+            self.evaluator = RemoteGidC3D4Evaluator(workspace_root=self.workspace_root)
+        else:
+            self.evaluator = DatagenFEMEvaluator(workspace_root=self.workspace_root, fem_backend=backend)
         self.inverse_label_weight = float(inverse_label_weight)
         default_workers = max(1, int((os.cpu_count() or 1) * 0.3))
         self.max_workers = max(1, int(max_workers or default_workers))
-        self.align_remote_graphmetamat_to_p222 = bool(align_remote_graphmetamat_to_p222)
+        self.align_remote_graphmetamat_to_p222 = bool(align_remote_graphmetamat_to_p222 and not is_gid_c3d4_backend)
 
     def simulate(
         self,
@@ -81,6 +88,13 @@ class HighPrecisionFEM:
 
         if not structures:
             return []
+        if hasattr(self.evaluator, "evaluate_many_explicit_structures"):
+            return self._simulate_many_with_batch_evaluator(
+                structures,
+                target_property=target_property,
+                max_workers=max_workers,
+                provenance=provenance,
+            )
         workers = max(1, int(max_workers or self.max_workers))
         if workers == 1 or len(structures) == 1:
             return [
@@ -119,6 +133,57 @@ class HighPrecisionFEM:
                 index = future_to_index[future]
                 results[index] = future.result()
         return [result for result in results if result is not None]
+
+    def _simulate_many_with_batch_evaluator(
+        self,
+        structures: list[dict[str, Any]],
+        *,
+        target_property: dict[str, Any] | None = None,
+        max_workers: int | None = None,
+        provenance: dict[str, Any] | None = None,
+    ) -> list[CurveLabelPair]:
+        fem_structures: list[dict[str, Any]] = []
+        alignments: list[dict[str, Any]] = []
+        targets: list[dict[str, Any]] = []
+        for structure in structures:
+            target = normalize_target_property(
+                target_property
+                or structure.get("scheduled_target")
+                or structure.get("target_property")
+                or structure.get("final_target")
+                or {}
+            )
+            fem_structure, alignment = self._prepare_fem_structure(dict(structure))
+            fem_structures.append(fem_structure)
+            alignments.append(alignment)
+            targets.append(target)
+
+        evaluations = self.evaluator.evaluate_many_explicit_structures(fem_structures, targets)
+        pairs: list[CurveLabelPair] = []
+        for index, (structure, target, alignment, evaluation) in enumerate(zip(structures, targets, alignments, evaluations)):
+            stress_curve = normalize_target_property(dict(evaluation.get("evaluated_property") or {}))
+            pairs.append(
+                CurveLabelPair(
+                    pair_id=self._batch_pair_id(index, structure),
+                    structure=dict(structure),
+                    stress_curve=stress_curve,
+                    label_source="simulation",
+                    label_weight=self.inverse_label_weight,
+                    model_consumers=("InverseDesigner", "ForwardSurrogate"),
+                    target_property=target,
+                    provenance={
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "backend": type(self.evaluator).__name__,
+                        "evaluation": evaluation,
+                        "fem_coordinate_alignment": alignment,
+                        "batch_index": index,
+                        "batch_size": len(structures),
+                        "parallel_workers": max(1, int(max_workers or self.max_workers)),
+                        **dict(provenance or {}),
+                    },
+                )
+            )
+        return pairs
 
     @staticmethod
     def _pair_id(prefix: str, structure: dict[str, Any]) -> str:

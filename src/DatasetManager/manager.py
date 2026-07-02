@@ -31,7 +31,8 @@ class DatasetManager:
         self.manifest_path = self.root_dir / "dataset_manifest.json"
         self.surrogate_inverse_weight = float(surrogate_inverse_weight)
         self.simulation_inverse_weight = float(simulation_inverse_weight)
-        self._inverse_train_cursor = 0
+        self._inverse_surrogate_train_cursor = 0
+        self._inverse_simulation_train_cursor = 0
         self._forward_train_cursor = 0
         self._write_manifest()
 
@@ -61,10 +62,17 @@ class DatasetManager:
         return [pair.to_forward_training_row() for pair in pairs if pair.label_source == "simulation"]
 
     def new_inverse_training_rows(self, *, consume: bool = True) -> list[dict[str, Any]]:
-        rows = self.inverse_training_rows()
-        new_rows = rows[self._inverse_train_cursor :]
+        surrogate_pairs = self._load_pairs(self.inverse_surrogate_path)
+        simulation_pairs = self._load_pairs(self.inverse_simulation_path)
+        new_surrogate_pairs = surrogate_pairs[self._inverse_surrogate_train_cursor :]
+        new_simulation_pairs = simulation_pairs[self._inverse_simulation_train_cursor :]
+        new_rows = [
+            pair.to_inverse_training_row()
+            for pair in [*new_surrogate_pairs, *new_simulation_pairs]
+        ]
         if consume:
-            self._inverse_train_cursor = len(rows)
+            self._inverse_surrogate_train_cursor = len(surrogate_pairs)
+            self._inverse_simulation_train_cursor = len(simulation_pairs)
         return new_rows
 
     def new_forward_training_rows(self, *, consume: bool = True) -> list[dict[str, Any]]:
@@ -130,7 +138,8 @@ class DatasetManager:
             elif hasattr(inverse_designer, "train"):
                 inverse_designer.train(self.inverse_training_rows())
             updated_inverse = True
-            self._inverse_train_cursor = len(self.inverse_training_rows())
+            self._inverse_surrogate_train_cursor = self._count_jsonl(self.inverse_surrogate_path)
+            self._inverse_simulation_train_cursor = self._count_jsonl(self.inverse_simulation_path)
 
         if forward_surrogate is not None and len(forward_rows) >= max(1, int(min_forward_rows)):
             if hasattr(forward_surrogate, "finetune"):

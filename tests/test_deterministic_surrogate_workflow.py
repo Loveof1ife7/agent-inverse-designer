@@ -126,6 +126,7 @@ def test_deterministic_loop_config_defaults_use_cold_start_triggers():
     assert config.min_forward_update_rows == 128
     assert config.min_inverse_update_rows == 64
     assert config.finetune_policy == "threshold"
+    assert config.surrogate_inverse_training_curve_nmae == 0.05
     assert config.auto_update_models is True
 
 
@@ -249,6 +250,37 @@ def test_surrogate_accept_waits_for_full_high_precision_batch(tmp_path):
     assert result["simulation_pairs"] == []
     assert result["accepted"] is False
     assert high_precision.simulate_calls == []
+
+
+def test_surrogate_training_pair_requires_close_curve_but_topk_still_queues_fem(tmp_path):
+    high_precision = FakeHighPrecisionFEM(scale=1.0)
+    dataset = DatasetManager(tmp_path / "datasets")
+    system = DeterministicSurrogateClosedLoopSystem(
+        inverse_designer=FakeInverseDesigner(),
+        forward_surrogate=FakeForwardSurrogate(scale=0.5),
+        high_precision_fem=high_precision,
+        dataset_manager=dataset,
+        config=DeterministicLoopConfig(
+            target_batch_size=1,
+            samples_per_target=1,
+            sim_batch_size=1,
+            finetune_policy="manual",
+            surrogate_inverse_training_curve_nmae=0.05,
+        ),
+        workspace_root=tmp_path / "workspace",
+    )
+
+    result = system.run_iteration(_curve(1.0), iteration=1)
+
+    assert result["surrogate_acceptance"][0]["accepted"] is False
+    assert result["surrogate_training_pairs"] == []
+    assert len(result["simulation_pairs"]) == 1
+    assert high_precision.simulate_calls
+    assert dataset.counts() == {
+        "inverse_surrogate_pairs": 0,
+        "inverse_simulation_pairs": 1,
+        "forward_simulation_pairs": 1,
+    }
 
 
 def test_run_breaks_after_high_precision_accepts(tmp_path):
@@ -383,3 +415,78 @@ def test_dataset_manager_uses_weighted_inverse_threshold_and_simulation_forward_
     assert summary.updated_forward_surrogate is True
     assert inverse.finetune_calls[-1][0]["label_source"] == "simulation"
     assert forward.finetune_calls[-1][0]["label_source"] == "simulation"
+
+
+def test_dataset_manager_keeps_separate_inverse_cursors_for_surrogate_and_simulation(tmp_path):
+    dataset = DatasetManager(tmp_path / "datasets")
+    inverse = FakeInverseDesigner()
+    forward = FakeForwardSurrogate()
+
+    for index in range(2):
+        dataset.append_surrogate_pair(
+            CurveLabelPair(
+                pair_id=f"surrogate_{index}",
+                structure={"structure_id": f"surr_{index}"},
+                stress_curve=_curve(0.5),
+                label_source="surrogate",
+                model_consumers=("InverseDesigner",),
+            )
+        )
+        dataset.append_simulation_pair(
+            CurveLabelPair(
+                pair_id=f"simulation_{index}",
+                structure={"structure_id": f"sim_{index}"},
+                stress_curve=_curve(1.0),
+                label_source="simulation",
+                model_consumers=("InverseDesigner", "ForwardSurrogate"),
+            )
+        )
+
+    summary = dataset.update_models(
+        inverse_designer=inverse,
+        forward_surrogate=forward,
+        min_inverse_rows=1,
+        min_forward_rows=10,
+    )
+
+    assert summary.updated_inverse_designer is True
+    assert [row["label_source"] for row in inverse.finetune_calls[-1]] == [
+        "surrogate",
+        "surrogate",
+        "simulation",
+        "simulation",
+    ]
+
+    dataset.append_surrogate_pair(
+        CurveLabelPair(
+            pair_id="surrogate_2",
+            structure={"structure_id": "surr_2"},
+            stress_curve=_curve(0.5),
+            label_source="surrogate",
+            model_consumers=("InverseDesigner",),
+        )
+    )
+    dataset.append_simulation_pair(
+        CurveLabelPair(
+            pair_id="simulation_2",
+            structure={"structure_id": "sim_2"},
+            stress_curve=_curve(1.0),
+            label_source="simulation",
+            model_consumers=("InverseDesigner", "ForwardSurrogate"),
+        )
+    )
+
+    summary = dataset.update_models(
+        inverse_designer=inverse,
+        forward_surrogate=forward,
+        min_inverse_rows=1,
+        min_forward_rows=10,
+    )
+
+    assert summary.inverse_training_rows == 2
+    assert summary.inverse_training_weight == 1.25
+    assert summary.updated_inverse_designer is True
+    assert [row["label_source"] for row in inverse.finetune_calls[-1]] == [
+        "surrogate",
+        "simulation",
+    ]

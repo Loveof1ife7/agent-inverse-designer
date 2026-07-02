@@ -52,6 +52,34 @@ DatasetManager
     stores labels, tracks training cursors, triggers model updates
 ```
 
+Current GT evaluation backend for GraphMetaMat truss candidates:
+
+```text
+HighPrecisionFEM(backend="gid_c3d4_remote")
+```
+
+This connects remote inverse designer outputs directly to the GID C3D4 solid
+FEM pipeline:
+
+```text
+remote inverse designer structure
+  coordinates / edges / edge_radii / rho
+-> export GID input folder
+  nodes.csv / struts.csv / meta.json / reference_curve.csv
+-> upload to CPU server
+-> run gid_c3d4_pipeline.py on cnode workers
+-> download data.csv / compare.png / logs
+-> CurveLabelPair(label_source="simulation")
+```
+
+Important boundary:
+
+```text
+GID C3D4 is the current GraphMetaMat GT evaluator.
+P222 physical-box alignment is legacy FEM logic and must not be used for
+GID C3D4 evaluation.
+```
+
 Core dual-path graph:
 
 ```mermaid
@@ -128,7 +156,9 @@ Only backlog fullness decides FEM execution.
 
 ```mermaid
 flowchart LR
-    A[ForwardSurrogate output] --> B[append_surrogate_pair]
+    A[ForwardSurrogate output] --> Z{curve_nmae <= surrogate_inverse_training_curve_nmae?}
+    Z -- yes --> B[append_surrogate_pair]
+    Z -- no --> Y[do not use as inverse training label]
     B --> C[inverse_surrogate_pairs.jsonl]
     C --> D[InverseDesigner finetune]
 
@@ -259,20 +289,28 @@ fallback:
     forward_surrogate.predict(...)
 ```
 
-Each surrogate prediction is stored as a `CurveLabelPair` through:
+Each surrogate prediction is evaluated as a `CurveLabelPair`. It is stored only
+when the surrogate curve is already close enough to the target:
+
+```text
+curve_nmae <= surrogate_inverse_training_curve_nmae
+```
+
+Passing pairs are written through:
 
 ```text
 DatasetManager.append_surrogate_pair()
 ```
 
-This writes to:
+to:
 
 ```text
 inverse_surrogate_pairs.jsonl
 ```
 
-Surrogate labels are weak labels for `InverseDesigner`. They are not truth for
-`ForwardSurrogate`, and they never decide final success.
+Surrogate labels are weak labels for `InverseDesigner`, so the gate is stricter
+than Top K scheduling. They are not truth for `ForwardSurrogate`, and they never
+decide final success.
 
 ### Step 5: Rank Candidates
 
@@ -400,6 +438,111 @@ run a full HighPrecisionFEM batch
 This trigger optimizes CPU throughput. It is not affected by surrogate accepted
 status.
 
+#### Active GT Backend: Remote GID C3D4
+
+For GraphMetaMat truss inverse-design candidates, CPU HighPrecisionFEM should
+use:
+
+```python
+from src.HighPrecisionFEM import HighPrecisionFEM
+
+high_precision_fem = HighPrecisionFEM(
+    workspace_root=...,
+    backend="gid_c3d4_remote",
+)
+```
+
+The implementation lives in:
+
+```text
+src/HighPrecisionFEM/gid_c3d4_remote.py
+src/HighPrecisionFEM/gid_c3d4_pipeline/gid_c3d4_pipeline.py
+```
+
+`backend="gid_c3d4_remote"` intentionally disables the old P222 coordinate
+alignment in `HighPrecisionFEM`.  The GID evaluator performs its own
+GraphMetaMat/GID alignment:
+
+```text
+input coordinates in GraphMetaMat normalized box: [-1, 1]^3
+GID C3D4 cell: 10 mm
+coordinate scale: 5.0
+coordinates: [-1, 1]^3 -> [-5, 5]^3 mm
+edge_radii: normalized radius * 5.0 -> strut_radius_mm
+unit_cell_size_L_mm = 10.0
+```
+
+Example:
+
+```text
+edge_radii[0] = 0.043493180451382854
+-> strut_radius_mm = 0.21746590225691426
+```
+
+The generated GID input folder contains:
+
+```text
+nodes.csv
+struts.csv
+meta.json
+reference_curve.csv
+```
+
+`reference_curve.csv` is written from the scheduler target for the FEM batch.
+It is for plotting/context only; the simulation label is always the C3D4
+`data.csv` curve extracted from Abaqus ODB.
+
+Remote CPU server defaults:
+
+```text
+ssh_alias: qingfang@210.45.73.118
+ssh_key:   C:\Users\qbli1\.ssh\210.45.73.118_0702090547_rsa.txt
+remote_root: /public/home/qingfang/gid_c3d4_closed_loop
+remote_python: /public/home/qingfang/.conda/envs/abaqus/bin/python
+remote_abaqus: /public/home/qingfang/abaqus/Commands/abq2022
+nodes: cnode1,cnode2
+cpus_per_job: 8
+max_parallel: 2
+```
+
+Environment overrides:
+
+```powershell
+$env:GID_C3D4_REMOTE_SSH_KEY="C:\Users\qbli1\.ssh\210.45.73.118_0702090547_rsa.txt"
+$env:GID_C3D4_REMOTE_NODES="cnode1,cnode2"
+$env:GID_C3D4_MAX_PARALLEL="2"
+$env:GID_C3D4_CPUS_PER_JOB="8"
+$env:GID_C3D4_ARRAY="1"
+$env:GID_C3D4_K_MIN="0.8"
+$env:GID_C3D4_K_MAX="1.2"
+```
+
+Smoke/coarse settings currently validated:
+
+```text
+array = 1
+k_min = 0.8
+k_max = 1.2
+cpus_per_job = 8
+```
+
+These settings validate the plumbing and remote throughput.  Higher-fidelity
+GraphMetaMat dataset reproduction should use the GID C3D4 alignment settings
+from `README_gid_c3d4_pipeline.md`, including `array=2` when comparing to
+2x2x2 dataset reference curves.
+
+Operational notes:
+
+```text
+1. Remote batch cases use short hash names such as c0000_6eab946235cf.
+   Abaqus fails with long job/path names via FOR0064/FOR0065 buffer errors.
+2. Jobs must run on cnode workers, not login01.
+3. The remote evaluator runs foreground jobs inside cnode ssh calls and waits
+   for data.csv before returning CurveLabelPair objects.
+4. Downloaded artifacts include data.csv, compare.png, logs, manifest/meta.
+   ODB download is disabled by default to avoid very large transfers.
+```
+
 ### Trigger B: GPU Forward FEM Network
 
 Condition:
@@ -452,7 +595,7 @@ min_inverse_update_rows = 64
 Data sources:
 
 ```text
-inverse_surrogate_pairs.jsonl
+inverse_surrogate_pairs.jsonl      # gated surrogate labels only
 inverse_simulation_pairs.jsonl
 ```
 
@@ -480,7 +623,7 @@ Rationale:
 
 ```text
 ForwardSurrogate is expected to approach HighPrecisionFEM over time.
-Therefore surrogate labels are useful weak supervision for InverseDesigner.
+Therefore sufficiently close surrogate labels are useful weak supervision for InverseDesigner.
 Simulation labels remain stronger supervision.
 ```
 
@@ -499,7 +642,7 @@ process_fast_queue()
 Stored by:
 
 ```text
-append_surrogate_pair()
+append_surrogate_pair(), only after the surrogate inverse-training gate passes
 ```
 
 Destination:
@@ -637,6 +780,7 @@ Default:
 
 ```text
 acceptance_curve_nmae = 0.05
+surrogate_inverse_training_curve_nmae = 0.05
 ```
 
 But their meanings are different:
